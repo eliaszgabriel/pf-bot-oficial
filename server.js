@@ -119,17 +119,17 @@ async function ensurePanelPinned(client, channelId) {
   }
   const channel = await client.channels.fetch(channelId);
   const pinned = await channel.messages.fetchPins().catch(() => null);
-  const mine = pinned?.filter(
+  const mine = Array.from(pinned?.values?.() ?? []).filter(
     (m) =>
       m.author?.id === client.user.id &&
       m.embeds?.[0]?.title === "🗂️ Painel de Recrutamento"
   );
 
-  if (mine && mine.size >= 1) {
-    const msg = mine.first();
+  if (mine && mine.length >= 1) {
+    const msg = mine[0];
     const { embed, row } = buildPanelMessage();
     await msg.edit({ embeds: [embed], components: [row] }).catch(() => {});
-    if (mine.size > 1) {
+    if (mine.length > 1) {
       for (const extra of mine.toJSON().slice(1)) {
         await extra.unpin().catch(() => {});
       }
