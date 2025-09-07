@@ -25,6 +25,15 @@ import {
   getRecruitCountsByMonth,
   db, // reusamos o mesmo SQLite
 } from "./db.js";
+// ---- Safe helper: check if a table has a given column (prevents "no such column") ----
+function hasColumn(table, column) {
+  try {
+    const rows = db.prepare(`PRAGMA table_info(${table});`).all();
+    return rows.some(r => r.name === column);
+  } catch (e) {
+    return false;
+  }
+}
 
 /* ================== ENV ================== */
 const {
@@ -180,7 +189,14 @@ CREATE TABLE IF NOT EXISTS recruits (
   source TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_recruits_passport ON recruits(passport);
+if (hasColumn('recruits', 'passport')) {
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_recruits_passport_norm
+    ON recruits (lower(replace(trim(passport), ' ', '')));
+  `);
+} else {
+  console.warn("[DB] recruits.passport não existe — índice não criado.");
+}
 `);
 
 /* ============ Express (health) ============ */
