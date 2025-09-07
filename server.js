@@ -179,9 +179,9 @@ CREATE TABLE IF NOT EXISTS passport_recruits (
 CREATE INDEX IF NOT EXISTS idx_passport_recruits_pass ON passport_recruits(passport);
 `);
 
-/* ---------- [ADICIONAL] Tabela recruits p/ /syncaprovados ---------- */
+/* ---------- [ADICIONAL] Tabela recruits_sync p/ /syncaprovados ---------- */
 db.exec(`
-CREATE TABLE IF NOT EXISTS recruits (
+CREATE TABLE IF NOT EXISTS recruits_sync (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   nome TEXT NOT NULL,
   passport TEXT NOT NULL UNIQUE,
@@ -192,13 +192,13 @@ CREATE TABLE IF NOT EXISTS recruits (
 `); // <-- fecha esse db.exec AQUI
 
 // Agora o índice, separado
-if (hasColumn("recruits", "passport")) {
+if (hasColumn("recruits_sync", "passport")) {
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_recruits_passport_norm
-    ON recruits (lower(replace(trim(passport), ' ', '')));
+    ON recruits_sync (lower(replace(trim(passport), ' ', '')));
   `);
 } else {
-  console.warn("[DB] recruits.passport não existe — índice não criado.");
+  console.warn("[DB] recruits_sync.passport não existe — índice não criado.");
 }
 
 /* ============ Express (health) ============ */
@@ -696,7 +696,7 @@ client.on(Events.InteractionCreate, async (ix) => {
       let ok = 0,
         fail = 0;
       const stmt = db.prepare(`
-        INSERT INTO recruits (nome, passport, status, source, updated_at)
+        INSERT INTO recruits_sync (nome, passport, status, source, updated_at)
         VALUES (?, ?, 'aprovado', 'sync', datetime('now'))
         ON CONFLICT(passport) DO UPDATE SET
           nome=excluded.nome,
