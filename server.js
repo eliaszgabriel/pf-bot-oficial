@@ -170,6 +170,19 @@ CREATE TABLE IF NOT EXISTS passport_recruits (
 CREATE INDEX IF NOT EXISTS idx_passport_recruits_pass ON passport_recruits(passport);
 `);
 
+/* ---------- [ADICIONAL] Tabela recruits p/ /syncaprovados ---------- */
+db.exec(`
+CREATE TABLE IF NOT EXISTS recruits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  nome TEXT NOT NULL,
+  passport TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL,
+  source TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recruits_passport ON recruits(passport);
+`);
+
 /* ============ Express (health) ============ */
 const app = express();
 app.use(bodyParser.json());
@@ -299,6 +312,41 @@ async function showModalSafe(ix, modal) {
 /* ============ Cache simples ============ */
 const tempMap = new Map();
 
+/* ============ [ADICIONAL] Helpers: apelido/passaporte + setter por TAG ============ */
+
+// Passaporte no final do apelido: "... | 12345"
+function extractPassportStrict(displayName = "") {
+  const m = displayName.match(/\|\s*(\d{1,7})\s*$/);
+  return m ? Number(m[1]) : null;
+}
+// Tag no começo do apelido: "[EST] Nome | 1234", "[AGT 3] ..."
+function extractBracketTag(displayName = "") {
+  const m = displayName.match(/^\s*\[([^\]]+)\]/);
+  return m ? m[1].trim() : null; // "EST" ou "AGT 3"
+}
+
+// Toggle em memória para set de cargo por TAG
+let roleSetterEnabled = (process.env.ROLE_SETTER_ENABLED || "0") === "1";
+const { ROLE_ESTAGIARIO_ID, ROLE_AGT3_ID } = process.env;
+const TAG_ROLE_MAP = { EST: ROLE_ESTAGIARIO_ID, "AGT 3": ROLE_AGT3_ID };
+
+async function applyRoleFromNickname(member) {
+  if (!roleSetterEnabled) return { changed: false, reason: "disabled" };
+  const name = member.displayName || member.user.username;
+  const tag = extractBracketTag(name);
+  const wanted = tag ? TAG_ROLE_MAP[tag] : null;
+  if (!wanted) return { changed: false, reason: "no_match" };
+
+  const toAdd = member.roles.cache.has(wanted) ? [] : [wanted];
+  const toRemove = [ROLE_ESTAGIARIO_ID, ROLE_AGT3_ID]
+    .filter(Boolean)
+    .filter((rid) => rid !== wanted && member.roles.cache.has(rid));
+
+  for (const rid of toAdd) await member.roles.add(rid).catch(() => {});
+  for (const rid of toRemove) await member.roles.remove(rid).catch(() => {});
+  return { changed: toAdd.length + toRemove.length > 0, tag, wanted };
+}
+
 /* ============ Ready & Login ============ */
 client.once("ready", async () => {
   console.log(`✅ Bot online como ${client.user.tag}`);
@@ -347,6 +395,86 @@ client.on(Events.InteractionCreate, async (ix) => {
       }
       const { embed, row } = buildPanelMessage();
       return ix.reply({ embeds: [embed], components: [row] });
+    }
+
+    /* ---------- [NOVO] /rolesetter (toggle do setter por TAG) ---------- */
+    if (ix.isChatInputCommand() && ix.commandName === "rolesetter") {
+      const enable = ix.options.getBoolean("enable", true);
+      roleSetterEnabled = !!enable;
+      return ix.reply({
+        content: `Role Setter por TAG: **${
+          roleSetterEnabled ? "LIGADO" : "DESLIGADO"
+        }**`,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    /* ---------- [NOVO] /setapelido → abre modal (Passaporte → Nome) ---------- */
+    if (ix.isChatInputCommand() && ix.commandName === "setapelido") {
+      const alvo = ix.options.getUser("alvo", true);
+      const tag = ix.options.getString("tag", true); // "EST" | "AGT 3"
+
+      const modal = new ModalBuilder()
+        .setCustomId(`modal_setapelido:${alvo.id}:${tag}`)
+        .setTitle("Definir apelido");
+
+      const passaporteInput = new TextInputBuilder()
+        .setCustomId("passaporte")
+        .setLabel("Passaporte (ex.: 1234)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+      const nomeInput = new TextInputBuilder()
+        .setCustomId("nome")
+        .setLabel("Nome (ex.: Elias)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+      const row1 = new ActionRowBuilder().addComponents(passaporteInput);
+      const row2 = new ActionRowBuilder().addComponents(nomeInput);
+      modal.addComponents(row1, row2);
+
+      return showModalSafe(ix, modal);
+    }
+
+    /* ---------- [NOVO] /setapelido (submit) → define apelido + ajusta cargo (se ligado) ---------- */
+    if (ix.isModalSubmit() && ix.customId.startsWith("modal_setapelido:")) {
+      await ix.deferReply({ flags: MessageFlags.Ephemeral });
+      const [, alvoId, tag] = ix.customId.split(":");
+      const passRaw = (ix.fields.getTextInputValue("passaporte") || "").trim();
+      const nomeRaw = (ix.fields.getTextInputValue("nome") || "").trim();
+
+      if (!/^\d{1,7}$/.test(passRaw)) {
+        return ix.editReply(
+          "❌ Informe um **passaporte numérico** (1–7 dígitos)."
+        );
+      }
+      if (!nomeRaw) {
+        return ix.editReply("❌ Informe um **nome** válido.");
+      }
+
+      const member = await ix.guild.members.fetch(alvoId).catch(() => null);
+      if (!member)
+        return ix.editReply("❌ Não consegui localizar o membro no servidor.");
+
+      const apelido = `[${tag}] ${nomeRaw} | ${passRaw}`;
+      try {
+        await member.setNickname(apelido, `Setado por ${ix.user.tag}`);
+      } catch {
+        return ix.editReply(
+          "⚠️ Não consegui alterar o apelido (verifique permissões/ordem dos cargos)."
+        );
+      }
+
+      const res = await applyRoleFromNickname(member).catch(() => ({
+        changed: false,
+      }));
+      return ix.editReply(
+        `✅ Apelido definido: **${apelido}**\n` +
+          `🔧 Cargos: ${
+            res.changed ? "ajustados" : "mantidos / recurso desligado"
+          }`
+      );
     }
 
     /* ---------- PASSAPORTE (consulta): abrir modal ---------- */
@@ -506,6 +634,88 @@ client.on(Events.InteractionCreate, async (ix) => {
       } catch (e) {
         console.error("atalho_ranking_modal erro:", e);
         return ix.editReply("❌ Erro ao gerar ranking.");
+      }
+    }
+
+    /* ---------- [NOVO] /syncaprovados → salva nome + passaporte + status=aprovado ---------- */
+    if (ix.isChatInputCommand() && ix.commandName === "syncaprovados") {
+      const preview = ix.options.getBoolean("preview") ?? true;
+      const limit = ix.options.getInteger("limit") ?? null;
+
+      await ix.deferReply({ flags: MessageFlags.Ephemeral });
+
+      const guild = await client.guilds.fetch(GUILD_ID);
+      const members = await guild.members.fetch();
+      const aprovados = members.filter((m) =>
+        m.roles.cache.has(ROLE_APROVADO_ID)
+      );
+      const arr = limit
+        ? aprovados.first(limit)
+        : Array.from(aprovados.values());
+
+      if (!arr.length) {
+        return ix.editReply("Nenhum membro com cargo **Aprovado** encontrado.");
+      }
+
+      if (preview) {
+        const linhas = arr
+          .slice(0, 25)
+          .map((m) => {
+            const nome = m.displayName || m.user.username;
+            const pass = extractPassportStrict(nome);
+            return `• ${nome}  | passaporte=${pass ?? "—"}`;
+          })
+          .join("\n");
+
+        return ix.editReply(
+          `**PREVIEW**: encontrados **${arr.length}** aprovados.\n` +
+            (linhas ? `${linhas}\n` : "") +
+            `Nada foi gravado. Rode \`/syncaprovados preview:false\` para executar.`
+        );
+      }
+
+      // UPSERT por passaporte
+      let ok = 0,
+        fail = 0;
+      const stmt = db.prepare(`
+        INSERT INTO recruits (nome, passport, status, source, updated_at)
+        VALUES (?, ?, 'aprovado', 'sync', datetime('now'))
+        ON CONFLICT(passport) DO UPDATE SET
+          nome=excluded.nome,
+          status='aprovado',
+          source='sync',
+          updated_at=datetime('now');
+      `);
+
+      for (const m of arr) {
+        const nome = m.displayName || m.user.username;
+        const pass = extractPassportStrict(nome);
+        if (!pass) {
+          fail++;
+          continue;
+        }
+        try {
+          stmt.run(nome, String(pass));
+          ok++;
+        } catch {
+          fail++;
+        }
+      }
+
+      const summary =
+        `✅ Sincronização concluída.\n` +
+        `• Total aprovados: **${arr.length}**\n` +
+        `• Gravados/atualizados: **${ok}**\n` +
+        `• Sem passaporte/falhas: **${fail}**`;
+
+      await ix.editReply(summary);
+
+      if (RECRUIT_LOG_CHANNEL_ID) {
+        try {
+          const ch = await client.channels.fetch(RECRUIT_LOG_CHANNEL_ID);
+          if (ch?.isTextBased())
+            await ch.send(`**/syncaprovados** — ${summary}`);
+        } catch {}
       }
     }
 
