@@ -29,7 +29,7 @@ import {
 function hasColumn(table, column) {
   try {
     const rows = db.prepare(`PRAGMA table_info(${table});`).all();
-    return rows.some(r => r.name === column);
+    return rows.some((r) => r.name === column);
   } catch (e) {
     return false;
   }
@@ -189,7 +189,10 @@ CREATE TABLE IF NOT EXISTS recruits (
   source TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-if (hasColumn('recruits', 'passport')) {
+`); // <-- fecha esse db.exec AQUI
+
+// Agora o índice, separado
+if (hasColumn("recruits", "passport")) {
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_recruits_passport_norm
     ON recruits (lower(replace(trim(passport), ' ', '')));
@@ -197,7 +200,6 @@ if (hasColumn('recruits', 'passport')) {
 } else {
   console.warn("[DB] recruits.passport não existe — índice não criado.");
 }
-`);
 
 /* ============ Express (health) ============ */
 const app = express();
