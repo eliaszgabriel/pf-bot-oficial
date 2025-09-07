@@ -118,7 +118,7 @@ async function ensurePanelPinned(client, channelId) {
     return;
   }
   const channel = await client.channels.fetch(channelId);
-  const pinned = await channel.messages.fetchPinned().catch(() => null);
+  const pinned = await channel.messages.fetchPins().catch(() => null);
   const mine = pinned?.filter(
     (m) =>
       m.author?.id === client.user.id &&
@@ -366,7 +366,7 @@ async function applyRoleFromNickname(member) {
 }
 
 /* ============ Ready & Login ============ */
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   console.log(`✅ Bot online como ${client.user.tag}`);
   await ensurePanelPinned(client, process.env.RECRUIT_CHANNEL_ID);
   try {
