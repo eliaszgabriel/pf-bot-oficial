@@ -99,3 +99,77 @@ export function getRecruitCountsByMonth(yyyy_mm, limit = 200) {
     )
     .all(yyyy_mm, limit);
 }
+
+
+// === MIGRAÇÕES PARA PERFIL/ALCUNHA (apelidos) ===
+export function ensureProfileMigrations() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS members_profile (
+      discord_id TEXT PRIMARY KEY,
+      nickname   TEXT NOT NULL,
+      qra        TEXT,
+      passport   TEXT,
+      tag        TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS nickname_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      discord_id TEXT NOT NULL,
+      old_nickname TEXT,
+      new_nickname TEXT NOT NULL,
+      changed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+}
+
+export function upsertMemberProfile({
+  discord_id,
+  nickname,
+  qra = null,
+  passport = null,
+  tag = null,
+}) {
+  const stmt = db.prepare(`
+    INSERT INTO members_profile (discord_id, nickname, qra, passport, tag, updated_at)
+    VALUES (@discord_id, @nickname, @qra, @passport, @tag, datetime('now'))
+    ON CONFLICT(discord_id) DO UPDATE SET
+      nickname   = excluded.nickname,
+      qra        = excluded.qra,
+      passport   = excluded.passport,
+      tag        = excluded.tag,
+      updated_at = excluded.updated_at
+  `);
+  stmt.run({ discord_id, nickname, qra, passport, tag });
+}
+
+export function getMemberProfile(discord_id) {
+  return db
+    .prepare(
+      `SELECT discord_id, nickname, qra, passport, tag, updated_at
+       FROM members_profile
+       WHERE discord_id = ?`
+    )
+    .get(discord_id);
+}
+
+export function insertNicknameHistory(discord_id, old_nickname, new_nickname) {
+  db.prepare(
+    `INSERT INTO nickname_history (discord_id, old_nickname, new_nickname)
+     VALUES (?, ?, ?)`
+  ).run(discord_id, old_nickname, new_nickname);
+}
+
+export function getNicknameHistory(discord_id, limit = 20) {
+  return db
+    .prepare(
+      `SELECT old_nickname, new_nickname, changed_at
+       FROM nickname_history
+       WHERE discord_id = ?
+       ORDER BY datetime(changed_at) DESC
+       LIMIT ?`
+    )
+    .all(discord_id, limit);
+}

@@ -18,12 +18,17 @@ import {
   AttachmentBuilder,
 } from "discord.js";
 import { InteractionResponseType } from "discord-api-types/v10";
+import cron from "node-cron";
 import {
   insertRecruit,
   getRecruitsByDiscordId,
   getRecruitCountsByDay,
   getRecruitCountsByMonth,
-  db, // reusamos o mesmo SQLite
+  db, // reusamos o mesmo SQLite,
+  ensureProfileMigrations,
+  upsertMemberProfile,
+  getMemberProfile,
+  insertNicknameHistory
 } from "./db.js";
 // ---- Safe helper: check if a table has a given column (prevents "no such column") ----
 function hasColumn(table, column) {
@@ -119,17 +124,21 @@ async function ensurePanelPinned(client, channelId) {
   }
   const channel = await client.channels.fetch(channelId);
   const pinned = await channel.messages.fetchPins().catch(() => null);
-  const mine = Array.from(pinned?.values?.() ?? []).filter(
+  // Normaliza para ARRAY (funciona se vier Collection, Map ou null)
+  const pinnedArr = Array.from(pinned?.values?.() ?? []);
+
+  // Agora filtre em cima do array
+  const mine = pinnedArr.filter(
     (m) =>
       m.author?.id === client.user.id &&
       m.embeds?.[0]?.title === "🗂️ Painel de Recrutamento"
   );
 
-  if (mine && mine.length >= 1) {
-    const msg = mine[0];
+  if (mine && mine.size >= 1) {
+    const msg = mine.first();
     const { embed, row } = buildPanelMessage();
     await msg.edit({ embeds: [embed], components: [row] }).catch(() => {});
-    if (mine.length > 1) {
+    if (mine.size > 1) {
       for (const extra of mine.toJSON().slice(1)) {
         await extra.unpin().catch(() => {});
       }
@@ -179,6 +188,20 @@ CREATE TABLE IF NOT EXISTS passport_recruits (
 CREATE INDEX IF NOT EXISTS idx_passport_recruits_pass ON passport_recruits(passport);
 `);
 
+// === ensure extra columns in passport_recruits ===
+try {
+  db.exec("ALTER TABLE passport_recruits ADD COLUMN source TEXT");
+} catch {}
+try {
+  db.exec("ALTER TABLE passport_recruits ADD COLUMN qra TEXT");
+} catch {}
+try {
+  db.exec("ALTER TABLE passport_recruits ADD COLUMN nickname TEXT");
+} catch {}
+try {
+  db.exec("ALTER TABLE passport_recruits ADD COLUMN photo_url TEXT");
+} catch {}
+
 /* ---------- [ADICIONAL] Tabela recruits_sync p/ /syncaprovados ---------- */
 db.exec(`
 CREATE TABLE IF NOT EXISTS recruits_sync (
@@ -205,7 +228,8 @@ if (hasColumn("recruits_sync", "passport")) {
 const app = express();
 app.use(bodyParser.json());
 app.get("/health", (_req, res) => res.json({ ok: true }));
-app.listen(3000, () => console.log("🌐 API interna ouvindo em :3000"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🌐 API interna ouvindo em :${PORT}`));
 
 /* ============ Helpers gerais ============ */
 
@@ -337,10 +361,27 @@ function extractPassportStrict(displayName = "") {
   const m = displayName.match(/\|\s*(\d{1,7})\s*$/);
   return m ? Number(m[1]) : null;
 }
+
+// Extrai o QRA (nome) de apelidos como "[AGT 3] Elias | 521" ou "Elias | 521" ou apenas "Elias"
+function extractQRA(displayName = "") {
+  // captura o trecho entre a tag inicial (opcional) e o pipe/passaporte (opcional)
+  const m = displayName.match(
+    /^\s*(?:\[[^\]]+\]\s*)?([^|]+?)(?:\s*\|\s*\d{1,10}\s*)?$/
+  );
+  return m ? m[1].trim() : (displayName || "").trim();
+}
 // Tag no começo do apelido: "[EST] Nome | 1234", "[AGT 3] ..."
 function extractBracketTag(displayName = "") {
   const m = displayName.match(/^\s*\[([^\]]+)\]/);
   return m ? m[1].trim() : null; // "EST" ou "AGT 3"
+}
+
+function parseNicknameFields(nickname = "") {
+  const passNum = extractPassportStrict(nickname);
+  const passport = passNum ? String(passNum) : null;
+  const qra = extractQRA(nickname) || null;
+  const tag = extractBracketTag(nickname) || null;
+  return { qra, passport, tag };
 }
 
 // Toggle em memória para set de cargo por TAG
@@ -365,10 +406,80 @@ async function applyRoleFromNickname(member) {
   return { changed: toAdd.length + toRemove.length > 0, tag, wanted };
 }
 
+/* ===== Registro de Slash Commands (guild) ===== */
+async function registerCommands() {
+  try {
+    const cmd = {
+      name: "syncaprovados",
+      description:
+        "Sincroniza aprovados do cargo com o banco (preview por padrão).",
+      options: [
+        {
+          name: "preview",
+          description: "Se true, só mostra prévia (não grava no banco).",
+          type: 5,
+          required: false,
+        },
+        {
+          name: "limit",
+          description: "Limite de usuários a processar.",
+          type: 4,
+          required: false,
+        },
+      ],
+    };
+    // cria/garante o comando sem sobrescrever outros do bot
+    await client.application?.commands.create(cmd, GUILD_ID);
+    console.log("✅ /syncaprovados registrado no servidor.");
+
+    const cmd2 = {
+      name: "syncnicks",
+      description: "Sincroniza os apelidos do servidor com o banco (perfil).",
+      options: [
+        { name: "limit", description: "Limite de usuários a processar (opcional).", type: 4, required: false }
+      ]
+    };
+    await client.application?.commands.create(cmd2, GUILD_ID);
+    console.log("✅ /syncnicks registrado no servidor.");
+
+    // User context command: right-click on user -> Corrigir pelo apelido
+    const ctx = {
+      name: "Corrigir pelo apelido",
+      type: 2 // USER context menu
+    };
+    await client.application?.commands.create(ctx, GUILD_ID);
+    console.log("✅ Context menu \"Corrigir pelo apelido\" registrado.");
+  } catch (e) {
+    console.error("Erro ao registrar slash commands:", e);
+  }
+}
+
 /* ============ Ready & Login ============ */
-client.once("clientReady", async () => {
+client.once(Events.ClientReady, async () => {
   console.log(`✅ Bot online como ${client.user.tag}`);
   await ensurePanelPinned(client, process.env.RECRUIT_CHANNEL_ID);
+
+// Cron diário para sincronizar apelidos às 03:00 America/Sao_Paulo
+try {
+  cron.schedule("0 3 * * *", async () => {
+    try {
+      const guild = await client.guilds.fetch(GUILD_ID);
+      const report = await syncNicknames(guild);
+      if (RECRUIT_LOG_CHANNEL_ID) {
+        try {
+          const ch = await client.channels.fetch(RECRUIT_LOG_CHANNEL_ID);
+          if (ch?.isTextBased()) {
+            await ch.send(`🕘 Sync de apelidos: verificados=${report.scanned}, criados=${report.created}, atualizados=${report.updated}, iguais=${report.unchanged}${report.errors ? ", erros=" + report.errors : ""}`);
+          }
+        } catch {}
+      }
+      console.log("[sync apelidos diário]", report);
+    } catch (e) {
+      console.error("Falha no cron /syncnicks:", e);
+    }
+  }, { timezone: "America/Sao_Paulo" });
+} catch {}
+
   try {
     const g = await client.guilds.fetch(GUILD_ID);
     const name = (id) => g.roles.cache.get(id)?.name || "N/A";
@@ -397,6 +508,8 @@ client.once("clientReady", async () => {
   } catch (e) {
     console.error("Falha ao ler cargos do guild:", e);
   }
+  // registra os comandos quando o bot estiver pronto
+  await registerCommands();
 });
 await client.login(DISCORD_TOKEN);
 
@@ -592,47 +705,20 @@ client.on(Events.InteractionCreate, async (ix) => {
         await guild.members.fetch();
 
         // tenta casar nomes com IDs p/ somar corretamente
-        const nameToId = new Map();
-        for (const mbr of guild.members.cache.values()) {
-          const keys = [
-            mbr.user.username,
-            mbr.displayName,
-            mbr.user.tag,
-          ].filter(Boolean);
-          for (const k of keys) nameToId.set(k.toLowerCase().trim(), mbr.id);
-        }
 
-        const agg = new Map();
-        for (const r of rows) {
-          let id =
-            r.recrutador_id && r.recrutador_id !== "" ? r.recrutador_id : null;
-          if (!id && r.recrutador) {
-            const guess = nameToId.get(r.recrutador.toLowerCase().trim());
-            if (guess) id = guess;
-          }
-          const key = id
-            ? `id:${id}`
-            : `name:${(r.recrutador || "").toLowerCase().trim()}`;
-          const prev = agg.get(key) || {
-            id: id || null,
-            name: r.recrutador || "(desconhecido)",
-            total: 0,
-          };
-          prev.total += Number(r.total) || 0;
-          if (id) {
-            const mem = guild.members.cache.get(id);
-            prev.name = mem?.displayName || mem?.user?.username || prev.name;
-          }
-          agg.set(key, prev);
-        }
-
-        const merged = [...agg.values()].sort((a, b) => b.total - a.total);
+        // Simplificado: usar recruiter_id direto de passport_recruits
+        await guild.members.fetch();
+        const merged = rows
+          .map((r) => ({ id: r.recrutador_id, total: Number(r.total) || 0 }))
+          .filter((r) => r.id)
+          .sort((a, b) => b.total - a.total);
         const totalGeral = merged.reduce((acc, it) => acc + it.total, 0);
         const lines = merged.map((it, i) => {
-          const who = it.id ? `<@${it.id}>` : `**${it.name}**`;
-          return `${i + 1}. ${who} — **${it.total}** recrutamento(s)`;
+          const who = `<@${it.id}>`;
+          const prof = getMemberProfile(it.id);
+          const name = prof?.nickname ? ` (${prof.nickname})` : "";
+          return `${i + 1}. ${who}${name} — **${it.total}** recrutamento(s)`;
         });
-
         const titulo =
           esc === "dia"
             ? `Ranking de Recrutadores — ${dd}/${mm}/${yyyy}`
@@ -657,6 +743,14 @@ client.on(Events.InteractionCreate, async (ix) => {
 
     /* ---------- [NOVO] /syncaprovados → salva nome + passaporte + status=aprovado ---------- */
     if (ix.isChatInputCommand() && ix.commandName === "syncaprovados") {
+      // 🔒 Restrição: apenas o dono pode executar
+      if (ix.user.id !== process.env.SYNC_OWNER_ID) {
+        return ix.reply({
+          content: "🚫 Você não tem permissão para usar este comando.",
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+
       const preview = ix.options.getBoolean("preview") ?? true;
       const limit = ix.options.getInteger("limit") ?? null;
 
@@ -705,6 +799,14 @@ client.on(Events.InteractionCreate, async (ix) => {
           updated_at=datetime('now');
       `);
 
+      // Também registra um \"recrutamento mínimo\" para consultas e ranking
+      const stmtRecruit = db.prepare(`
+        INSERT INTO passport_recruits (passport, user_id, recruiter_id, score, classification, status, source, qra, nickname, created_at)
+        SELECT ?, ?, ?, 0, 'Aprovado', 'Aprovado', 'sync', ?, ?, datetime('now')
+        WHERE NOT EXISTS (
+          SELECT 1 FROM passport_recruits WHERE passport = ? AND user_id = ?
+        )
+      `);
       for (const m of arr) {
         const nome = m.displayName || m.user.username;
         const pass = extractPassportStrict(nome);
@@ -715,6 +817,19 @@ client.on(Events.InteractionCreate, async (ix) => {
         try {
           stmt.run(nome, String(pass));
           ok++;
+
+          // grava também no histórico oficial, se ainda não existir
+          try {
+            stmtRecruit.run(
+              String(pass),
+              m.id,
+              ix.user.id,
+              extractQRA(nome || ""),
+              nome || "",
+              String(pass),
+              m.id
+            );
+          } catch {}
         } catch {
           fail++;
         }
@@ -773,16 +888,27 @@ client.on(Events.InteractionCreate, async (ix) => {
           )
           .get(passport);
 
-        if (!history.length && !exo && !bl) {
+        // NEW: procurar também em recruits_sync (resultado do /syncaprovados)
+        const syncRow = db
+          .prepare(
+            `SELECT nome, passport, status, updated_at
+           FROM recruits_sync
+           WHERE replace(passport,' ','') = replace(?, ' ', '')
+           LIMIT 1`
+          )
+          .get(passport);
+
+        if (!history.length && !exo && !bl && !syncRow) {
           return ix.editReply(
             `Nenhum registro encontrado para o passaporte **${passport}**.`
           );
         }
 
-        const lastUserId = history[0]?.user_id || null;
+        const lastUserId = history[0]?.user_id || profileByPassport?.discord_id || null;
+        const prof2 = lastUserId ? getMemberProfile(lastUserId) : profileByPassport || null;
         const conscritoField = lastUserId
-          ? `<@${lastUserId}> (${lastUserId})`
-          : "—";
+          ? `${prof2?.nickname ? `**${prof2.nickname}**\n` : ""}<@${lastUserId}> (${lastUserId})`
+          : (profileByPassport?.nickname ? `**${profileByPassport.nickname}**` : "—");
 
         const histBlock = history.length
           ? history
@@ -840,6 +966,21 @@ client.on(Events.InteractionCreate, async (ix) => {
           inline: false,
         });
 
+        // Indicar origem do último registro, se houver
+        try {
+          const last = db
+            .prepare(
+              `SELECT source FROM passport_recruits WHERE passport = ? ORDER BY datetime(created_at) DESC LIMIT 1`
+            )
+            .get(passport);
+          if (last && last.source)
+            embed.addFields({
+              name: "🧾 Origem do registro",
+              value: last.source.toUpperCase(),
+              inline: true,
+            });
+        } catch {}
+
         return ix.editReply({ embeds: [embed] });
       } catch (e) {
         console.error("passaporte:modal erro:", e);
@@ -852,9 +993,30 @@ client.on(Events.InteractionCreate, async (ix) => {
       try {
         await ix.deferReply({ flags: MessageFlags.Ephemeral });
         const user = ix.options.getUser("usuario", true);
+        const prof = getMemberProfile(user.id);
         const limit = ix.options.getInteger("limit") ?? 5;
-        const rows = getRecruitsByDiscordId(user.id, limit);
 
+        let rows = getRecruitsByDiscordId(user.id, limit);
+        // Fallback: usar passport_recruits caso não haja dados na tabela antiga
+        if (!rows || rows.length === 0) {
+          const alt = db
+            .prepare(
+              `
+    SELECT classification AS classification, status AS status, score AS nota, created_at, recruiter_id
+    FROM passport_recruits
+    WHERE user_id = ?
+    ORDER BY datetime(created_at) DESC
+    LIMIT ?
+  `
+            )
+            .all(user.id, limit);
+          rows = alt.map((r) => ({
+            status: r.status || r.classification || "-",
+            nota: r.nota || 0,
+            created_at: r.created_at,
+            recrutador: r.recruiter_id ? `<@${r.recruiter_id}>` : "(sem id)",
+          }));
+        }
         if (!rows.length)
           return ix.editReply(`Nenhum registro para ${user.tag}.`);
 
@@ -863,7 +1025,7 @@ client.on(Events.InteractionCreate, async (ix) => {
             `• ${r.status} — ${r.nota} pts — ${r.created_at} — por ${r.recrutador}`
         );
         const embed = new EmbedBuilder()
-          .setTitle(`Histórico do Conscrito ${user.tag}`)
+          .setTitle(`Histórico do Conscrito ${prof?.nickname || user.tag}`)
           .setDescription(lines.join("\n"))
           .setColor(0x3498db);
 
@@ -918,47 +1080,19 @@ client.on(Events.InteractionCreate, async (ix) => {
         const guild = await ix.client.guilds.fetch(GUILD_ID);
         await guild.members.fetch();
 
-        const nameToId = new Map();
-        for (const mbr of guild.members.cache.values()) {
-          const keys = [
-            mbr.user.username,
-            mbr.displayName,
-            mbr.user.tag,
-          ].filter(Boolean);
-          for (const k of keys) nameToId.set(k.toLowerCase().trim(), mbr.id);
-        }
-
-        const agg = new Map();
-        for (const r of rows) {
-          let id =
-            r.recrutador_id && r.recrutador_id !== "" ? r.recrutador_id : null;
-          if (!id && r.recrutador) {
-            const guess = nameToId.get(r.recrutador.toLowerCase().trim());
-            if (guess) id = guess;
-          }
-          const key = id
-            ? `id:${id}`
-            : `name:${(r.recrutador || "").toLowerCase().trim()}`;
-          const prev = agg.get(key) || {
-            id: id || null,
-            name: r.recrutador || "(desconhecido)",
-            total: 0,
-          };
-          prev.total += Number(r.total) || 0;
-          if (id) {
-            const mem = guild.members.cache.get(id);
-            prev.name = mem?.displayName || mem?.user?.username || prev.name;
-          }
-          agg.set(key, prev);
-        }
-
-        const merged = [...agg.values()].sort((a, b) => b.total - a.total);
+        // Simplificado: usar recruiter_id direto de passport_recruits
+        await guild.members.fetch();
+        const merged = rows
+          .map((r) => ({ id: r.recrutador_id, total: Number(r.total) || 0 }))
+          .filter((r) => r.id)
+          .sort((a, b) => b.total - a.total);
         const totalGeral = merged.reduce((acc, it) => acc + it.total, 0);
         const lines = merged.map((it, i) => {
-          const who = it.id ? `<@${it.id}>` : `**${it.name}**`;
-          return `${i + 1}. ${who} — **${it.total}** recrutamento(s)`;
+          const who = `<@${it.id}>`;
+          const prof = getMemberProfile(it.id);
+          const name = prof?.nickname ? ` (${prof.nickname})` : "";
+          return `${i + 1}. ${who}${name} — **${it.total}** recrutamento(s)`;
         });
-
         const titulo =
           escopo === "dia"
             ? `Ranking de Recrutadores — ${dd}/${mm}/${yyyy}`
@@ -1051,13 +1185,13 @@ client.on(Events.InteractionCreate, async (ix) => {
       ];
       const row = new ActionRowBuilder().addComponents(buttons);
 
-      const msg = await ix.reply({
+      await ix.reply({
         content:
           "Você pode **definir o passaporte**, **enviar a foto** (basta mandar no chat após definir) ou **pular**.",
         components: [row],
         flags: MessageFlags.Ephemeral,
-        fetchReply: true,
       });
+      const msg = await ix.fetchReply();
       await autoDeleteEphemeral(ix, msg, TTL_PICK);
       return;
     }
@@ -1088,13 +1222,13 @@ client.on(Events.InteractionCreate, async (ix) => {
       ];
       const row = new ActionRowBuilder().addComponents(buttons);
 
-      const msg = await ix.reply({
+      await ix.reply({
         content:
           "Você pode **definir o passaporte**, **enviar a foto** (basta mandar no chat após definir) ou **pular**.",
         components: [row],
         flags: MessageFlags.Ephemeral,
-        fetchReply: true,
       });
+      const msg = await ix.fetchReply();
       await autoDeleteEphemeral(ix, msg, TTL_PICK);
       return;
     }
@@ -1126,11 +1260,11 @@ client.on(Events.InteractionCreate, async (ix) => {
 
       tempMap.set(`${ix.user.id}:${userId}:passport`, passport);
 
-      const ok = await ix.reply({
+      await ix.reply({
         content: `✅ Passaporte **${passport}** definido para <@${userId}>.`,
         flags: MessageFlags.Ephemeral,
-        fetchReply: true,
       });
+      const ok = await ix.fetchReply();
       await autoDeleteEphemeral(ix, ok, TTL_PASSPORT_OK);
 
       const ch = await ix.channel?.fetch();
@@ -1138,7 +1272,6 @@ client.on(Events.InteractionCreate, async (ix) => {
         content:
           "Envie **agora** uma **imagem** neste canal (1 anexo, até **8MB**). Você tem **2 minutos**.\nDica: aguarde o upload completar antes de enviar.",
         flags: MessageFlags.Ephemeral,
-        fetchReply: true,
       });
       await autoDeleteEphemeral(ix, prompt, TTL_PHOTO_PROMPT);
 
@@ -1159,7 +1292,6 @@ client.on(Events.InteractionCreate, async (ix) => {
                 content:
                   "⚠️ A imagem precisa ter **até 8MB**. Tente novamente.",
                 flags: MessageFlags.Ephemeral,
-                fetchReply: true,
               });
               await autoDeleteEphemeral(ix, warn, TTL_PHOTO_OK);
               return;
@@ -1182,7 +1314,6 @@ client.on(Events.InteractionCreate, async (ix) => {
                 "✅ Foto recebida! Clique abaixo para abrir **Parte 1**.",
               components: [row],
               flags: MessageFlags.Ephemeral,
-              fetchReply: true,
             });
             await autoDeleteEphemeral(ix, got, TTL_PHOTO_OK);
           })
@@ -1190,7 +1321,6 @@ client.on(Events.InteractionCreate, async (ix) => {
             const t = await ix.followUp({
               content: "⏱️ Tempo para enviar a **imagem** esgotado.",
               flags: MessageFlags.Ephemeral,
-              fetchReply: true,
             });
             await autoDeleteEphemeral(ix, t, TTL_PHOTO_OK);
             const openBtn = new ButtonBuilder()
@@ -1202,7 +1332,6 @@ client.on(Events.InteractionCreate, async (ix) => {
               content: "Você pode prosseguir abrindo **Parte 1**.",
               components: [row],
               flags: MessageFlags.Ephemeral,
-              fetchReply: true,
             });
             await autoDeleteEphemeral(ix, nxt, TTL_PHOTO_OK);
           });
@@ -1215,11 +1344,11 @@ client.on(Events.InteractionCreate, async (ix) => {
       const userId = ix.customId.split(":")[1];
       const pass = tempMap.get(`${ix.user.id}:${userId}:passport`);
       if (!pass) {
-        const warn = await ix.reply({
+        await ix.reply({
           content: "⚠️ Defina o **passaporte** primeiro.",
           flags: MessageFlags.Ephemeral,
-          fetchReply: true,
         });
+        const warn = await ix.fetchReply();
         await autoDeleteEphemeral(ix, warn, TTL_PASSPORT_OK);
         return;
       }
@@ -1264,11 +1393,11 @@ client.on(Events.InteractionCreate, async (ix) => {
       const userId = ix.customId.split(":")[1];
       const pass = tempMap.get(`${ix.user.id}:${userId}:passport`);
       if (!pass) {
-        const warn = await ix.reply({
+        await ix.reply({
           content: "⚠️ Defina o **passaporte** primeiro.",
           flags: MessageFlags.Ephemeral,
-          fetchReply: true,
         });
+        const warn = await ix.fetchReply();
         await autoDeleteEphemeral(ix, warn, TTL_PASSPORT_OK);
         return;
       }
@@ -1326,12 +1455,12 @@ client.on(Events.InteractionCreate, async (ix) => {
         .setStyle(ButtonStyle.Primary);
 
       const row = new ActionRowBuilder().addComponents(openBtn);
-      const msg = await ix.reply({
+      await ix.reply({
         content: "Parte 1 recebida. Clique abaixo para abrir **Parte 2**.",
         components: [row],
         flags: MessageFlags.Ephemeral,
-        fetchReply: true,
       });
+      const msg = await ix.fetchReply();
       await autoDeleteEphemeral(ix, msg, TTL_PHOTO_OK);
       return;
     }
@@ -1340,11 +1469,11 @@ client.on(Events.InteractionCreate, async (ix) => {
     if (ix.isButton() && ix.customId.startsWith("abrirParte2:")) {
       const userId = ix.customId.split(":")[1];
       if (!tempMap.has(`${ix.user.id}:${userId}`)) {
-        const warn = await ix.reply({
+        await ix.reply({
           content: "⚠️ Não encontrei a Parte 1. Comece novamente.",
           flags: MessageFlags.Ephemeral,
-          fetchReply: true,
         });
+        const warn = await ix.fetchReply();
         await autoDeleteEphemeral(ix, warn, TTL_PHOTO_OK);
         return;
       }
@@ -1416,6 +1545,7 @@ client.on(Events.InteractionCreate, async (ix) => {
       tempMap.delete(fotoKey);
       tempMap.delete(`${ix.user.id}:${discordId}:fotoName`);
 
+      // dados adicionais
       const a = {
         ...partial,
         mod_codigo0: ix.fields.getTextInputValue("mod_codigo0"),
@@ -1783,4 +1913,109 @@ client.on(Events.InteractionCreate, async (ix) => {
       });
     } catch {}
   }
+
+/* ---------- /syncnicks (manual) ---------- */
+if (ix.isChatInputCommand() && ix.commandName === "syncnicks") {
+  await ix.deferReply({ flags: MessageFlags.Ephemeral });
+  // Permissão: Diretor ou Subdiretor
+  const allowed = [process.env.ROLE_DIRETOR_ID, process.env.ROLE_SUBDIRETOR_ID].filter(Boolean);
+  const isAllowed = allowed.length === 0 || ix.member?.roles?.cache?.some(r => allowed.includes(r.id));
+  if (!isAllowed) {
+    return ix.editReply("❌ Você não tem permissão para executar este comando.");
+  }
+  try {
+    const guild = await ix.client.guilds.fetch(process.env.GUILD_ID);
+    const report = await syncNicknames(guild);
+    await ix.editReply(
+      "✅ Sync de apelidos concluído.\n" +
+      `• Verificados: **${report.scanned}**\n` +
+      `• Criados: **${report.created}**\n` +
+      `• Atualizados: **${report.updated}**\n` +
+      `• Iguais: **${report.unchanged}**` +
+      (report.errors ? `\n• Erros: **${report.errors}**` : "")
+    );
+  } catch (e) {
+    console.error("syncnicks erro:", e);
+    await ix.editReply("⚠️ Falha ao sincronizar apelidos.");
+  }
+}
+
+
+// Context menu: USER -> Corrigir pelo apelido
+if (ix.isUserContextMenuCommand && (ix.commandName === "Corrigir pelo apelido" || ix.commandName === "Corrigir pelo apelido")) {
+  try {
+    await ix.deferReply({ flags: MessageFlags.Ephemeral });
+    // Permissão: Diretor ou Subdiretor
+    const allowed = [process.env.ROLE_DIRETOR_ID, process.env.ROLE_SUBDIRETOR_ID].filter(Boolean);
+    const isAllowed = allowed.length === 0 || ix.member?.roles?.cache?.some(r => allowed.includes(r.id));
+    if (!isAllowed) {
+      return ix.editReply("❌ Você não tem permissão para executar esta ação.");
+    }
+    const target = ix.targetUser || ix.options.getUser?.("user");
+    if (!target) return ix.editReply("Não consegui obter o usuário.");
+    const guild = await ix.client.guilds.fetch(process.env.GUILD_ID);
+    const member = await guild.members.fetch(target.id);
+    const res = await syncOneMemberNickname(member);
+    await ix.editReply(res.updated ? "✅ Perfil atualizado a partir do apelido." : "Nada a atualizar.");
+  } catch (e) {
+    console.error("Context menu Corrigir pelo apelido:", e);
+    await ix.editReply("⚠️ Falha ao corrigir pelo apelido.");
+  }
+}
+
 });
+
+export async function syncNicknames(guild) {
+  ensureProfileMigrations();
+  const result = { scanned: 0, created: 0, updated: 0, unchanged: 0, errors: 0 };
+  const members = await guild.members.fetch();
+  for (const [, member] of members) {
+    if (member.user.bot) continue;
+    result.scanned++;
+    const nickname = member.displayName || member.nickname || member.user.username || "";
+    const { qra, passport, tag } = parseNicknameFields(nickname);
+    try {
+      const existing = getMemberProfile(member.id);
+      if (!existing) {
+        upsertMemberProfile({ discord_id: member.id, nickname, qra, passport, tag });
+        result.created++;
+      } else if (existing.nickname !== nickname || existing.qra != qra || existing.passport != passport || existing.tag != tag) {
+        if (existing.nickname !== nickname) {
+          insertNicknameHistory(member.id, existing.nickname, nickname);
+        }
+        upsertMemberProfile({ discord_id: member.id, nickname, qra, passport, tag });
+        result.updated++;
+      } else {
+        result.unchanged++;
+      }
+    } catch (e) {
+      result.errors++;
+    }
+  }
+  return result;
+}
+
+export async function syncOneMemberNickname(member) {
+  ensureProfileMigrations();
+  if (!member || member.user?.bot) return { updated: false, reason: "invalid_member" };
+  const nickname = member.displayName || member.nickname || member.user.username || "";
+  const { qra, passport, tag } = parseNicknameFields(nickname);
+  const existing = getMemberProfile(member.id);
+  if (!existing) {
+    upsertMemberProfile({ discord_id: member.id, nickname, qra, passport, tag });
+    return { updated: true, created: true };
+  }
+  let changed = false;
+  if (existing.nickname !== nickname) {
+    insertNicknameHistory(member.id, existing.nickname, nickname);
+    changed = true;
+  }
+  if (existing.qra !== qra || existing.passport !== passport || existing.tag !== tag) {
+    changed = true;
+  }
+  if (changed) {
+    upsertMemberProfile({ discord_id: member.id, nickname, qra, passport, tag });
+  }
+  return { updated: changed, created: false };
+}
+
