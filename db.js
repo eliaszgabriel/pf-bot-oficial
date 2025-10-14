@@ -173,3 +173,40 @@ export function getNicknameHistory(discord_id, limit = 20) {
     )
     .all(discord_id, limit);
 }
+
+
+
+export function getProfileByPassport(passport) {
+  return db.prepare(
+    `SELECT discord_id, nickname, qra, passport, tag, updated_at
+     FROM members_profile
+     WHERE replace(passport,' ','') = replace(?, ' ', '')`
+  ).get(passport);
+}
+
+
+export function getLatestRecruitByPassport(passport) {
+  return db.prepare(
+    `SELECT *
+       FROM recruits
+      WHERE replace(passport,' ','') = replace(?, ' ', '')
+      ORDER BY id DESC LIMIT 1`
+  ).get(passport);
+}
+
+// === Sync de Patentes: tabelas auxiliares ===
+db.exec(`
+  CREATE TABLE IF NOT EXISTS rank_map (
+    role_id TEXT PRIMARY KEY,
+    tag TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+  );
+  CREATE TABLE IF NOT EXISTS promotions_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    discord_id TEXT NOT NULL,
+    old_rank TEXT,
+    new_rank TEXT NOT NULL,
+    changed_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+try { db.exec(`ALTER TABLE recruits ADD COLUMN current_rank TEXT;`); } catch {}
