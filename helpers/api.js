@@ -14,7 +14,7 @@ const api = axios.create({
 export async function upsertRecruit(payload) {
   if (!process.env.PF_API_URL) return;
   try {
-    await api.post("/api/recruits/upsert", payload);
+    await api.post("/api/recruits", payload);
   } catch (e) {
     console.error("[API] upsertRecruit:", e.response?.data || e.message);
   }
